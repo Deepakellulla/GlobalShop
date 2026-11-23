@@ -1,0 +1,5 @@
+BOT_TOKEN=123456:your-botfather-token
+DOOMS_API_KEY=tgb_your_key_here
+ADMIN_IDS=111111111
+MARKUP_PERCENT=20
+ADMIN_CONTACT=@your_username
