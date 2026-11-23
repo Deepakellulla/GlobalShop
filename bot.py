@@ -12,6 +12,7 @@ import html
 import logging
 import math
 import os
+import re
 import sqlite3
 import time
 
@@ -19,7 +20,14 @@ import httpx
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Markup
 from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 try:
     from dotenv import load_dotenv
@@ -35,6 +43,18 @@ ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "the admin")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 BASE = "https://doomsbot.store/api/public/v1"
 PAGE_SIZE = 8
+
+# Crypto (NOWPayments) - automatic deposits
+NOW_KEY = os.getenv("NOWPAYMENTS_API_KEY", "")
+CRYPTO_CURRENCY = os.getenv("CRYPTO_CURRENCY", "usdttrc20")
+CRYPTO_LABEL = os.getenv("CRYPTO_LABEL", "USDT (TRC20)")
+MIN_DEPOSIT_USD = float(os.getenv("MIN_DEPOSIT_USD", "5"))
+
+# UPI - manual verification
+UPI_ID = os.getenv("UPI_ID", "")
+UPI_NAME = os.getenv("UPI_NAME", "")
+UPI_RATE = float(os.getenv("UPI_RATE", "90"))  # INR per 1 USD credited
+UPI_MIN_INR = int(os.getenv("UPI_MIN_INR", "300"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("reseller")
@@ -63,6 +83,19 @@ CREATE TABLE IF NOT EXISTS orders(
     codes TEXT,
     created INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deposits(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    method TEXT NOT NULL,                 -- crypto|upi
+    usd INTEGER NOT NULL,                 -- cents to credit
+    inr INTEGER,
+    status TEXT NOT NULL,                 -- awaiting|pending|waiting|partial|credited|rejected|expired|failed|refunded
+    ref TEXT,                             -- UTR (upi) or provider payment_id (crypto)
+    pay_address TEXT,
+    pay_amount TEXT,
+    created INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS dep_ref ON deposits(method, ref) WHERE ref IS NOT NULL;
 """
 )
 db.commit()
@@ -234,6 +267,181 @@ async def purchase(bot, uid: int, pid: str, qty: int):
     return "review", oid
 
 
+# ------------------------------------------------------------------ deposits
+NOW_BASE = "https://api.nowpayments.io/v1"
+
+
+async def nowp(method: str, path: str, **kw):
+    async with httpx.AsyncClient(timeout=25) as c:
+        r = await c.request(method, NOW_BASE + path, headers={"x-api-key": NOW_KEY}, **kw)
+    try:
+        body = r.json()
+    except Exception:
+        body = {}
+    return r.status_code, body
+
+
+def credit_deposit(dep_id: int):
+    """Atomically credit a deposit exactly once. Returns the row, or None if already processed."""
+    d = db.execute("SELECT * FROM deposits WHERE id=?", (dep_id,)).fetchone()
+    if not d:
+        return None
+    cur = db.execute(
+        "UPDATE deposits SET status='credited' WHERE id=? AND status IN ('waiting','partial','pending')",
+        (dep_id,),
+    )
+    if cur.rowcount == 0:
+        db.rollback()
+        return None
+    db.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["usd"], d["user_id"]))
+    db.commit()
+    return d
+
+
+async def sync_crypto(bot, d) -> str:
+    """Ask the provider for the payment status and act on it. Returns our resulting status."""
+    status, body = await nowp("GET", f"/payment/{d['ref']}")
+    if status != 200:
+        return d["status"]
+    ps = body.get("payment_status", "")
+    if ps == "finished":
+        dep = credit_deposit(d["id"])
+        if dep:
+            await bot.send_message(
+                dep["user_id"],
+                f"✅ Deposit received: <b>{money(dep['usd'])}</b> added.\n"
+                f"Balance: {money(balance_of(dep['user_id']))}",
+                parse_mode="HTML",
+            )
+        return "credited"
+    if ps == "partially_paid" and d["status"] == "waiting":
+        db.execute("UPDATE deposits SET status='partial' WHERE id=?", (d["id"],))
+        db.commit()
+        await bot.send_message(
+            d["user_id"],
+            f"⚠️ Deposit #{d['id']} was underpaid. Send the remaining amount to the same address "
+            f"or contact {esc(ADMIN_CONTACT)}.",
+            parse_mode="HTML",
+        )
+        await notify_admins(bot, f"⚠️ Crypto deposit #{d['id']} (user {d['user_id']}) is <b>partially paid</b>.")
+        return "partial"
+    if ps in ("failed", "expired", "refunded") and d["status"] in ("waiting", "partial"):
+        db.execute("UPDATE deposits SET status=? WHERE id=?", (ps, d["id"]))
+        db.commit()
+        await bot.send_message(d["user_id"], f"❌ Deposit #{d['id']} {ps}. If you paid, contact {esc(ADMIN_CONTACT)}.", parse_mode="HTML")
+        return ps
+    return d["status"]
+
+
+async def poll_crypto(ctx: ContextTypes.DEFAULT_TYPE):
+    rows = db.execute(
+        "SELECT * FROM deposits WHERE method='crypto' AND status IN ('waiting','partial') AND created>?",
+        (int(time.time()) - 3 * 86400,),
+    ).fetchall()
+    for d in rows:
+        try:
+            await sync_crypto(ctx.bot, d)
+        except Exception:
+            log.exception("poll error for deposit %s", d["id"])
+        await asyncio.sleep(0.5)
+
+
+async def start_crypto(uid: int, usd: float):
+    """Create a crypto payment. Returns (text, keyboard)."""
+    back = Markup([back_btn("dep")])
+    if usd < MIN_DEPOSIT_USD:
+        return f"❌ Minimum deposit is ${MIN_DEPOSIT_USD:g}.", back
+    if usd > 5000:
+        return "❌ Amount too large.", back
+    open_cnt = db.execute(
+        "SELECT COUNT(*) c FROM deposits WHERE user_id=? AND method='crypto' AND status='waiting' AND created>?",
+        (uid, int(time.time()) - 3600),
+    ).fetchone()["c"]
+    if open_cnt >= 3:
+        return "⏳ You already have open payments. Complete or wait for them to expire.", back
+    cur = db.execute(
+        "INSERT INTO deposits(user_id,method,usd,status,created) VALUES (?,?,?,?,?)",
+        (uid, "crypto", to_cents(usd), "awaiting", int(time.time())),
+    )
+    did = cur.lastrowid
+    db.commit()
+    try:
+        status, body = await nowp(
+            "POST",
+            "/payment",
+            json={
+                "price_amount": usd,
+                "price_currency": "usd",
+                "pay_currency": CRYPTO_CURRENCY,
+                "order_id": f"dep-{did}",
+            },
+        )
+    except httpx.HTTPError:
+        status, body = None, {}
+    if status not in (200, 201) or not body.get("pay_address"):
+        log.error("NOWPayments create failed: %s %s", status, body)
+        db.execute("UPDATE deposits SET status='failed' WHERE id=?", (did,))
+        db.commit()
+        return "❌ Could not create the payment right now. Please try again later.", back
+    db.execute(
+        "UPDATE deposits SET status='waiting', ref=?, pay_address=?, pay_amount=? WHERE id=?",
+        (str(body["payment_id"]), body["pay_address"], str(body["pay_amount"]), did),
+    )
+    db.commit()
+    text = (
+        f"🪙 <b>Deposit #{did}</b> — {money(to_cents(usd))}\n\n"
+        f"Send exactly:\n<code>{esc(body['pay_amount'])}</code> {esc(CRYPTO_LABEL)}\n\n"
+        f"To address:\n<code>{esc(body['pay_address'])}</code>\n"
+    )
+    if body.get("payin_extra_id"):
+        text += f"\nMemo/Tag: <code>{esc(body['payin_extra_id'])}</code>\n"
+    text += (
+        f"\n⚠️ Use the <b>{esc(CRYPTO_LABEL)}</b> network only and send the exact amount. "
+        "Your balance is credited automatically after confirmation."
+    )
+    kb = Markup([[Btn("🔄 Check status", callback_data=f"dck:{did}")], back_btn("menu", "🏠 Menu")])
+    return text, kb
+
+
+def upi_admin_text(d) -> str:
+    return (
+        f"🇮🇳 <b>UPI deposit #{d['id']}</b>\n"
+        f"User: <code>{d['user_id']}</code>\n"
+        f"Amount: ₹{d['inr']} → credit {money(d['usd'])}\n"
+        f"UTR: <code>{esc(d['ref'])}</code>"
+    )
+
+
+def upi_admin_kb(did: int) -> Markup:
+    return Markup([[Btn("✅ Approve", callback_data=f"da:{did}"), Btn("❌ Reject", callback_data=f"dr:{did}")]])
+
+
+def start_upi(uid: int, inr: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Create a UPI deposit awaiting the customer's UTR. Returns (text, keyboard)."""
+    back = Markup([back_btn("dep")])
+    if inr < UPI_MIN_INR:
+        return f"❌ Minimum UPI deposit is ₹{UPI_MIN_INR}.", back
+    if inr > 200000:
+        return "❌ Amount too large.", back
+    usd_cents = int(inr / UPI_RATE * 100)
+    cur = db.execute(
+        "INSERT INTO deposits(user_id,method,usd,inr,status,created) VALUES (?,?,?,?,?,?)",
+        (uid, "upi", usd_cents, inr, "awaiting", int(time.time())),
+    )
+    did = cur.lastrowid
+    db.commit()
+    ctx.user_data["await"] = ("utr", did)
+    text = (
+        f"🇮🇳 <b>UPI deposit #{did}</b>\n\n"
+        f"Pay exactly <b>₹{inr}</b> to:\nUPI ID: <code>{esc(UPI_ID)}</code>\n"
+        + (f"Name: {esc(UPI_NAME)}\n" if UPI_NAME else "")
+        + f"\nYou will receive: <b>{money(usd_cents)}</b> (₹{UPI_RATE:g} = $1)\n\n"
+        "After paying, <b>send the UTR / transaction reference number</b> here as a message "
+        "(you can also send a screenshot). An admin will verify and credit your balance."
+    )
+    return text, Markup([back_btn("dep", "❌ Cancel")])
+
+
 # ------------------------------------------------------------------ keyboards
 def main_menu() -> Markup:
     return Markup(
@@ -291,13 +499,105 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     if kind == "dep":
+        ctx.user_data.pop("await", None)
+        rows = []
+        if NOW_KEY:
+            rows.append([Btn("🪙 Crypto — automatic", callback_data="dc")])
+        if UPI_ID:
+            rows.append([Btn("🇮🇳 UPI — manual verification", callback_data="du")])
+        rows.append(back_btn())
+        text = "➕ <b>Add funds</b>\nChoose a payment method:"
+        if len(rows) == 1:
+            text = f"➕ <b>Add funds</b>\n\nContact {esc(ADMIN_CONTACT)} to pay. Your ID: <code>{uid}</code>"
+        return await show(update, text, Markup(rows))
+
+    if kind == "dc":  # crypto amount menu
+        ctx.user_data.pop("await", None)
+        rows = [
+            [Btn(f"${n}", callback_data=f"dca:{n}") for n in (5, 10, 20, 50) if n >= MIN_DEPOSIT_USD],
+            [Btn("✏️ Custom amount", callback_data="dcc")],
+            back_btn("dep"),
+        ]
+        return await show(
+            update, f"🪙 <b>Crypto deposit</b>\nPaid in {esc(CRYPTO_LABEL)}. Choose an amount:", Markup(rows)
+        )
+
+    if kind == "dcc":
+        ctx.user_data["await"] = ("crypto_amt",)
+        return await show(
+            update, f"✏️ Send the amount in USD you want to add (min ${MIN_DEPOSIT_USD:g}).", Markup([back_btn("dc")])
+        )
+
+    if kind == "dca":
+        await q.answer()
+        await q.edit_message_text("⏳ Creating payment…")
+        text, kb = await start_crypto(uid, float(parts[1]))
+        return await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
+    if kind == "dck":  # check crypto status
+        d = db.execute("SELECT * FROM deposits WHERE id=? AND user_id=?", (int(parts[1]), uid)).fetchone()
+        if not d:
+            return await q.answer("Not found", show_alert=True)
+        if d["status"] in ("waiting", "partial"):
+            try:
+                await sync_crypto(ctx.bot, d)
+            except Exception:
+                log.exception("manual sync failed")
+            d = db.execute("SELECT * FROM deposits WHERE id=?", (d["id"],)).fetchone()
+        labels = {
+            "waiting": "⏳ Waiting for payment / confirmations",
+            "partial": "⚠️ Underpaid — send the remainder or contact admin",
+            "credited": "✅ Credited",
+            "expired": "⌛ Expired",
+            "failed": "❌ Failed",
+            "refunded": "↩️ Refunded",
+        }
+        await q.answer(labels.get(d["status"], d["status"]), show_alert=True)
+        return
+
+    if kind == "du":  # UPI amount menu
+        ctx.user_data["await"] = ("upi_amt",)
+        amounts = [a for a in (300, 500, 1000, 2000) if a >= UPI_MIN_INR]
+        rows = [[Btn(f"₹{a}", callback_data=f"dua:{a}") for a in amounts], back_btn("dep")]
         return await show(
             update,
-            "➕ <b>Add funds</b>\n\n"
-            f"Contact {esc(ADMIN_CONTACT)} to pay, and send your ID:\n<code>{uid}</code>\n"
-            "Your balance is updated once payment is confirmed.",
-            Markup([back_btn()]),
+            f"🇮🇳 <b>UPI deposit</b>\nRate: ₹{UPI_RATE:g} = $1 • Min ₹{UPI_MIN_INR}\n"
+            "Pick an amount or type your own amount in ₹:",
+            Markup(rows),
         )
+
+    if kind == "dua":
+        text, kb = start_upi(uid, int(parts[1]), ctx)
+        return await show(update, text, kb)
+
+    if kind in ("da", "dr"):  # admin approve / reject UPI
+        if uid not in ADMIN_IDS:
+            return await q.answer("Not allowed", show_alert=True)
+        did = int(parts[1])
+        d = db.execute("SELECT * FROM deposits WHERE id=? AND method='upi'", (did,)).fetchone()
+        if not d:
+            return await q.answer("Not found", show_alert=True)
+        if kind == "da":
+            if not credit_deposit(did):
+                return await q.answer("Already processed", show_alert=True)
+            note = f"✅ Approved by {uid}"
+            user_msg = (
+                f"✅ UPI payment verified. <b>{money(d['usd'])}</b> added.\n"
+                f"Balance: {money(balance_of(d['user_id']))}"
+            )
+        else:
+            cur = db.execute("UPDATE deposits SET status='rejected' WHERE id=? AND status='pending'", (did,))
+            db.commit()
+            if cur.rowcount == 0:
+                return await q.answer("Already processed", show_alert=True)
+            note = f"❌ Rejected by {uid}"
+            user_msg = f"❌ Your UPI deposit #{did} could not be verified. Contact {esc(ADMIN_CONTACT)}."
+        try:
+            await ctx.bot.send_message(d["user_id"], user_msg, parse_mode="HTML")
+        except Exception:
+            pass
+        await q.answer("Done")
+        return await q.edit_message_text(upi_admin_text(d) + f"\n\n{note}", parse_mode="HTML")
 
     if kind == "orders":
         rows = db.execute(
@@ -487,6 +787,88 @@ async def settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Marked as settled.")
 
 
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    st = ctx.user_data.get("await")
+    if not st:
+        return
+    uid = update.effective_user.id
+    ensure_user(update.effective_user)
+    txt = (update.message.text or "").strip()
+
+    if st[0] == "crypto_amt":
+        try:
+            usd = float(txt.replace("$", "").replace(",", ""))
+        except ValueError:
+            return await update.message.reply_text("Please send a number, e.g. 15")
+        ctx.user_data.pop("await", None)
+        msg = await update.message.reply_text("⏳ Creating payment…")
+        text, kb = await start_crypto(uid, usd)
+        return await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+    if st[0] == "upi_amt":
+        try:
+            inr = int(float(txt.replace("₹", "").replace(",", "")))
+        except ValueError:
+            return await update.message.reply_text("Please send a number, e.g. 500")
+        text, kb = start_upi(uid, inr, ctx)
+        return await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+    if st[0] == "utr":
+        did = st[1]
+        utr = re.sub(r"\s+", "", txt).upper()
+        if not re.fullmatch(r"[A-Z0-9]{10,25}", utr):
+            return await update.message.reply_text("That doesn't look like a valid UTR. Send the 12-digit reference number.")
+        try:
+            cur = db.execute(
+                "UPDATE deposits SET ref=?, status='pending' WHERE id=? AND user_id=? AND status='awaiting'",
+                (utr, did, uid),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            return await update.message.reply_text("⚠️ This UTR was already submitted.")
+        if cur.rowcount == 0:
+            ctx.user_data.pop("await", None)
+            return await update.message.reply_text("This deposit is no longer open. Start again from Add funds.")
+        ctx.user_data.pop("await", None)
+        d = db.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
+        await update.message.reply_text(
+            f"✅ Deposit #{did} submitted for verification. You'll be notified once it's approved."
+        )
+        for aid in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(aid, upi_admin_text(d), parse_mode="HTML", reply_markup=upi_admin_kb(did))
+            except Exception:
+                log.exception("could not notify admin %s", aid)
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    d = db.execute(
+        "SELECT * FROM deposits WHERE user_id=? AND method='upi' AND status IN ('awaiting','pending') "
+        "ORDER BY id DESC LIMIT 1",
+        (uid,),
+    ).fetchone()
+    if not d:
+        return
+    for aid in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(aid, f"📎 Screenshot for UPI deposit #{d['id']} from user <code>{uid}</code>", parse_mode="HTML")
+            await update.message.copy(aid)
+        except Exception:
+            log.exception("could not send screenshot to %s", aid)
+    extra = "" if d["status"] == "pending" else " Please also send the UTR number as text."
+    await update.message.reply_text("📎 Screenshot sent to the admin." + extra)
+
+
+@admin_only
+async def deposits_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = db.execute("SELECT * FROM deposits WHERE method='upi' AND status='pending'").fetchall()
+    if not rows:
+        return await update.message.reply_text("No pending UPI deposits.")
+    for d in rows:
+        await update.message.reply_text(upi_admin_text(d), parse_mode="HTML", reply_markup=upi_admin_kb(d["id"]))
+
+
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.exception("handler error", exc_info=ctx.error)
 
@@ -501,7 +883,12 @@ def main():
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("refund", refund_cmd))
     app.add_handler(CommandHandler("settle", settle))
+    app.add_handler(CommandHandler("deposits", deposits_cmd))
     app.add_handler(CallbackQueryHandler(router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    if NOW_KEY:
+        app.job_queue.run_repeating(poll_crypto, interval=45, first=20)
     app.add_error_handler(on_error)
     log.info("Bot running…")
     app.run_polling()
