@@ -432,6 +432,30 @@ async def supplier(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    products = await get_products(force=True)
+    if not products:
+        return await update.message.reply_text("Could not load products (check API key / try again).")
+    lines = []
+    for i, p in enumerate(products, 1):
+        stock = p.get("stock")
+        flag = "✅" if p.get("in_stock") else "❌"
+        lines.append(
+            f"{i}. {flag} <b>{esc(p['name'])}</b>\n"
+            f"   cost ${float(p['price']):.2f} → sell {money(sell_cents(p['price']))} | stock {esc(stock)}\n"
+            f"   id: <code>{esc(p['id'])}</code>"
+        )
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) > 3800:
+            await update.message.reply_text(chunk, parse_mode="HTML")
+            chunk = ""
+        chunk += line + "\n\n"
+    if chunk:
+        await update.message.reply_text(chunk, parse_mode="HTML")
+
+
+@admin_only
 async def review(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = db.execute("SELECT * FROM orders WHERE status='review'").fetchall()
     if not rows:
@@ -473,6 +497,7 @@ def main():
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("addbalance", addbalance))
     app.add_handler(CommandHandler("supplier", supplier))
+    app.add_handler(CommandHandler("catalog", catalog))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("refund", refund_cmd))
     app.add_handler(CommandHandler("settle", settle))
